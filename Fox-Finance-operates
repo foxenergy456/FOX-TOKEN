@@ -1,0 +1,169 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+// Interface for the FOX Token (ERC-20)
+interface IFOXToken is IERC20 {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+}
+
+// YieldyFOX: Rebasing token for staking FOX
+contract YieldyFOX is IERC20, ReentrancyGuard {
+    using SafeMath for uint256;
+
+    string public constant name = "YieldyFOX";
+    string public constant symbol = "YFOX";
+    uint8 public constant decimals = 18;
+
+    IFOXToken public immutable foxToken; // Reference to the FOX Token contract
+    address public daoTreasury; // DAO treasury address for reward funding
+    uint256 private _totalSupply; // Total supply of YieldyFOX (rebasing)
+    mapping(address => uint256) private _balances; // User balances of YieldyFOX
+    mapping(address => mapping(address => uint256)) private _allowances; // Allowances for YieldyFOX
+    uint256 public rewardRate; // Rewards per second per staked FOX (scaled by 1e18)
+    uint256 public lastUpdateTime; // Last time rewards were updated
+    uint256 public rewardPerTokenStored; // Accumulated rewards per token
+    mapping(address => uint256) public userRewardPerTokenPaid; // Rewards paid per user
+    mapping(address => uint256) public rewards; // Pending rewards per user
+
+    // Events
+    event Staked(address indexed user, uint256 foxAmount, uint256 yfoxAmount);
+    event Unstaked(address indexed user, uint256 foxAmount, uint256 yfoxAmount);
+    event RewardAdded(uint256 amount);
+    event RewardClaimed(address indexed user, uint256 amount);
+
+    // Modifiers
+    modifier onlyDAOTreasury() {
+        require(msg.sender == daoTreasury, "Only DAO treasury can call this");
+        _;
+    }
+
+    constructor(address _foxToken, address _daoTreasury) {
+        foxToken = IFOXToken(_foxToken);
+        daoTreasury = _daoTreasury;
+        lastUpdateTime = block.timestamp;
+    }
+
+    // Stake FOX to receive YieldyFOX (1:1)
+    function stake(uint256 _foxAmount) external nonReentrant {
+        require(_foxAmount > 0, "Amount must be greater than 0");
+        _updateReward(msg.sender);
+
+        // Transfer FOX from user to contract
+        require(foxToken.transferFrom(msg.sender, address(this), _foxAmount), "FOX transfer failed");
+
+        // Mint YieldyFOX 1:1
+        _totalSupply = _totalSupply.add(_foxAmount);
+        _balances[msg.sender] = _balances[msg.sender].add(_foxAmount);
+
+        emit Staked(msg.sender, _foxAmount, _foxAmount);
+    }
+
+    // Unstake YieldyFOX to receive FOX back
+    function unstake(uint256 _yfoxAmount) external nonReentrant {
+        require(_yfoxAmount > 0, "Amount must be greater than 0");
+        require(_balances[msg.sender] >= _yfoxAmount, "Insufficient YieldyFOX balance");
+        _updateReward(msg.sender);
+
+        // Burn YieldyFOX
+        _totalSupply = _totalSupply.sub(_yfoxAmount);
+        _balances[msg.sender] = _balances[msg.sender].sub(_yfoxAmount);
+
+        // Transfer FOX back to user
+        require(foxToken.transfer(msg.sender, _yfoxAmount), "FOX transfer failed");
+
+        emit Unstaked(msg.sender, _yfoxAmount, _yfoxAmount);
+    }
+
+    // Claim accumulated rewards
+    function claimRewards() external nonReentrant {
+        _updateReward(msg.sender);
+        uint256 reward = rewards[msg.sender];
+        if (reward > 0) {
+            rewards[msg.sender] = 0;
+            require(foxToken.transferFrom(daoTreasury, msg.sender, reward), "Reward transfer failed");
+            emit RewardClaimed(msg.sender, reward);
+        }
+    }
+
+    // Add rewards to the contract (called by DAO treasury)
+    function addRewards(uint256 _rewardAmount) external onlyDAOTreasury {
+        require(_rewardAmount > 0, "Reward amount must be greater than 0");
+        require(foxToken.transferFrom(daoTreasury, address(this), _rewardAmount), "Reward transfer failed");
+
+        // Update reward rate (simplified: assumes rewards distributed over 30 days)
+        rewardRate = _rewardAmount.div(30 days);
+        lastUpdateTime = block.timestamp;
+
+        emit RewardAdded(_rewardAmount);
+    }
+
+    // Update reward calculations
+    function _updateReward(address _account) private {
+        rewardPerTokenStored = rewardPerToken();
+        lastUpdateTime = block.timestamp;
+
+        if (_account != address(0)) {
+            rewards[_account] = earned(_account);
+            userRewardPerTokenPaid[_account] = rewardPerTokenStored;
+        }
+    }
+
+    // Calculate reward per token
+    function rewardPerToken() public view returns (uint256) {
+        if (_totalSupply == 0) {
+            return rewardPerTokenStored;
+        }
+        return
+            rewardPerTokenStored.add(
+                block.timestamp.sub(lastUpdateTime).mul(rewardRate).mul(1e18).div(_totalSupply)
+            );
+    }
+
+    // Calculate earned rewards for an account
+    function earned(address _account) public view returns (uint256) {
+        return
+            _balances[_account]
+                .mul(rewardPerToken().sub(userRewardPerTokenPaid[_account]))
+                .div(1e18)
+                .add(rewards[_account]);
+    }
+
+    // ERC-20 functions for YieldyFOX
+    function totalSupply() external view override returns (uint256) {
+        return _totalSupply;
+    }
+
+    function balanceOf(address account) external view override returns (uint256) {
+        return _balances[account];
+    }
+
+    function transfer(address recipient, uint256 amount) external override returns (bool) {
+        revert("YieldyFOX is non-transferable");
+    }
+
+    function allowance(address owner, address spender) external view override returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    function approve(address spender, uint256 amount) external override returns (bool) {
+        _allowances[msg.sender][spender] = amount;
+        emit Approval(msg.sender, spender, amount);
+        return true;
+    }
+
+    function transferFrom(address sender, address recipient, uint256 amount) external override returns (bool) {
+        revert("YieldyFOX is non-transferable");
+    }
+
+    // Governance voting power (reflects staked FOX)
+    function governanceVotingPower(address _account) external view returns (uint256) {
+        return _balances[_account];
+    }
+}
